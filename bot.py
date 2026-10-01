@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -60,6 +61,10 @@ def group_inventory(items: list[dict[str, Any]]) -> list[tuple[str, int, int, fl
     return out
 
 
+def is_uuid(s: str) -> bool:
+    return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", s))
+
+
 def parse_sell_cb(data: str) -> tuple[str, int, int | None]:
     """'pick:3' / 'price:3:150' / 'go:3:150' → (action, n, cents | None)."""
     action, _, rest = data.partition(":")
@@ -74,19 +79,6 @@ def rec_price(item: dict[str, Any]) -> float | None:
         return float(str((item.get("offerRecommendedPrice") or {}).get("Amount")))
     except (TypeError, ValueError):
         return None
-
-
-def price_buttons(n: int, rec: float | None, ask: float | None) -> list[list[InlineKeyboardButton]]:
-    """Варианты цены: рекомендация, ask-0.01, ask, ask+0.01 (без дублей)."""
-    variants: list[float] = []
-    for p in (rec, ask - 0.01 if ask else None, ask, (ask + 0.01) if ask else None):
-        if p is not None and p > 0 and all(abs(p - v) > 0.005 for v in variants):
-            variants.append(p)
-    out = []
-    for p in variants:
-        cents = max(round(p * 100), 1)
-        out.append([InlineKeyboardButton(text=f"${p:.2f}", callback_data=f"price:{n}:{cents}")])
-    return out
 
 
 def confirm_kb(n: int, cents: int) -> InlineKeyboardMarkup:
@@ -147,6 +139,11 @@ class Monitor:
         item = self.sell_menu[n - 1]
         if item_id(item) in self.listed:
             return "Этот предмет уже выставлен"
+        if not is_uuid(item_id(item)):
+            return (
+                "❌ Предмет ещё в Steam-инвентаре (не задепонирован на DMarket).\n"
+                "Сначала /deposit — после депозита он получит ID для продажи."
+            )
         try:
             resp = await self.dm.create_sell_offers([{"assetId": item_id(item), "priceCents": cents}])
         except DMarketError as exc:
@@ -156,6 +153,20 @@ class Monitor:
             return f"❌ Отклонено: {str(failed[0])[:200]}"
         self.listed.add(item_id(item))
         return f"💰 Выставлено: {item_name(item)} за ${cents / 100:.2f}"
+
+    async def deposit_items(self, items: list[dict[str, Any]]) -> str:
+        """POST /marketplace-api/v1/deposit-assets — задепонировать предметы из Steam на DMarket."""
+        ids = [item_id(i) for i in items]
+        try:
+            resp = await self.dm.deposit_assets(ids)
+        except DMarketError as exc:
+            return f"❌ Депозит: {str(exc)[:200]}"
+        dep_id = resp.get("DepositID") or resp.get("depositId") or "?"
+        return (
+            f"📦 Депозит запрошен ({len(ids)} шт, ID {dep_id}).\n"
+            "Подтверди трейд в Steam (могут прийти 2 оффера), затем подожди пару минут "
+            "и проверь /invent — предметы станут inMarket."
+        )
 
     async def execute_sell_if_confirmed(self, n: int, cents: int, args: list[str]) -> str:
         if len(args) < 3 or args[2].lower() != "подтвердить":
@@ -230,6 +241,7 @@ async def main() -> None:
         BotCommand(command="status", description="Состояние бота и кейса"),
         BotCommand(command="invent", description="Инвентарь DMarket"),
         BotCommand(command="sell", description="Выставить предмет на продажу"),
+        BotCommand(command="deposit", description="Перенести предмет из Steam на DMarket"),
     ])
 
     async def notify(text: str) -> None:
@@ -315,17 +327,83 @@ async def main() -> None:
         item = monitor.sell_menu[n - 1]
         if action == "pick":
             ask = await dm.lowest_ask(item_name(item), settings.game_id)
-            rows = price_buttons(n, rec_price(item), ask)
-            kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel")]])
-            await edit(
-                f"«{item_name(item)}»\nЛучший ask: {'${:.2f}'.format(ask) if ask else '—'}\nВыбери цену:",
-                kb,
+            rec = rec_price(item)
+            in_market = bool(item.get("inMarket"))
+            price_hint = f"Лучший ask: {'${:.2f}'.format(ask) if ask else '—'}, рек. цена: ${rec:.2f}" if rec else (
+                f"Лучший ask: {'${:.2f}'.format(ask) if ask else '—'}"
             )
+            if not in_market:
+                await edit(
+                    f"«{item_name(item)}» — ещё в Steam (не задепонирован).\n"
+                    f"Сначала /deposit, после депозита появится ID для продажи."
+                )
+            else:
+                await edit(
+                    f"«{item_name(item)}»\n{price_hint}\n\n"
+                    f"Напиши в чат цену: sell {n} <цена$>  (например: sell {n} 1.93)"
+                )
         elif action == "price" and cents is not None:
             await edit(f"Выставить «{item_name(item)}» за ${cents / 100:.2f}?", confirm_kb(n, cents))
         elif action == "go" and cents is not None:
             await edit(await monitor.execute_sell(n, cents))
         await cb.answer()
+
+    @dp.message(Command("deposit"))
+    async def deposit_cmd(message: Message) -> None:
+        args = (message.text or "").split()[1:]
+        steam_items = [i for i in monitor.last_items if not i.get("inMarket")]
+        if not steam_items:
+            # перепроверка живым запросом
+            steam_items = [i for i in await dm.user_inventory(settings.game_id) if not i.get("inMarket")]
+        if not steam_items:
+            await message.answer("Нет предметов в Steam, доступных для депозита")
+            return
+        if not args:
+            monitor.sell_menu = steam_items[:20]  # переиспользуем нумерацию
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"📦 {item_name(i)[:30]}", callback_data=f"dep:{n}")]
+                for n, i in enumerate(monitor.sell_menu, 1)
+            ])
+            await message.answer("Что задепонировать на DMarket?", reply_markup=kb)
+            return
+        try:
+            num = int(args[0])
+            item = monitor.sell_menu[num - 1]
+        except (IndexError, ValueError):
+            await message.answer("Формат: /deposit (список) или /deposit <№>")
+            return
+        await message.answer(await monitor.deposit_items([item]))
+
+    @dp.callback_query(F.data.startswith("dep:"))
+    async def dep_cb(cb: CallbackQuery) -> None:
+        n = int((cb.data or "").partition(":")[2])
+        if not (1 <= n <= len(monitor.sell_menu)):
+            await cb.answer("Список устарел — вызови /deposit заново", show_alert=True)
+            return
+        if isinstance(cb.message, Message):
+            await cb.message.edit_text(await monitor.deposit_items([monitor.sell_menu[n - 1]]))
+        await cb.answer()
+
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def price_input(message: Message) -> None:
+        """Текстовый ввод цены: 'sell 3 1.93' (без слэша) после выбора предмета."""
+        parts = (message.text or "").split()
+        if len(parts) < 3 or parts[0].lower() != "sell":
+            return
+        try:
+            n = int(parts[1])
+            cents = round(float(parts[2].replace(",", ".")) * 100)
+        except ValueError:
+            await message.answer("Формат: sell <№> <цена$> — например: sell 3 1.93")
+            return
+        if not (1 <= n <= len(monitor.sell_menu)):
+            await message.answer("Неверный номер — вызови /sell заново")
+            return
+        item = monitor.sell_menu[n - 1]
+        await message.answer(
+            f"Выставить «{item_name(item)}» за ${cents / 100:.2f}?",
+            reply_markup=confirm_kb(n, cents),
+        )
 
     async def monitor_loop() -> None:
         await notify(

@@ -130,10 +130,16 @@ class DMarketClient:
     async def create_sell_offers(self, offers: list[dict[str, Any]]) -> Any:
         """POST /marketplace-api/v2/offers:batchCreate — выставить предметы на продажу.
 
-        offers: [{"assetId": <attributes.id из инвентаря>, "priceCents": 199}]
+        offers: [{"assetId": <UUID>, "priceCents": 199}]
         """
         return await self._request(
             "POST", "/marketplace-api/v2/offers:batchCreate", json_body={"requests": offers}
+        )
+
+    async def deposit_assets(self, asset_ids: list[str]) -> Any:
+        """POST /marketplace-api/v1/deposit-assets — перенос предметов из Steam на DMarket."""
+        return await self._request(
+            "POST", "/marketplace-api/v1/deposit-assets", json_body={"AssetID": asset_ids}
         )
 
 
