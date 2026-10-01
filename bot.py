@@ -23,10 +23,14 @@ TRADABLE_STATUSES = {"tradable", "active", "available"}
 
 
 def item_id(item: dict[str, Any]) -> str:
-    return str(item.get("itemId") or item.get("id") or "")
+    return str(((item.get("attributes") or {}).get("id")) or item.get("itemId") or item.get("id") or "")
 
 
 def is_tradable(item: dict[str, Any]) -> bool:
+    # v2: attributes.tradable (bool) + tradeLockDays; неизвестная схема → считаем залоченным
+    attr = item.get("attributes") or {}
+    if "tradable" in attr:
+        return bool(attr.get("tradable")) and not attr.get("tradeLockDays")
     return str(item.get("status", "")).strip().lower() in TRADABLE_STATUSES
 
 
@@ -70,20 +74,19 @@ class Monitor:
         if ask is None:
             await self.notify("⚠️ Не удалось получить цену стакана — продажа отложена до следующего цикла")
             return
-        price = f"{max(ask - 0.01, 0.01):.2f}"
-        offers = [
-            {"targetId": item_id(i), "price": {"amount": price, "currency": self.cfg.sell_currency}}
-            for i in items
-        ]
+        cents = max(round((ask - 0.01) * 100), 1)
+        offers = [{"assetId": item_id(i), "priceCents": cents} for i in items]
         try:
-            await self.dm.create_sell_offers(offers)
+            resp = await self.dm.create_sell_offers(offers)
         except DMarketError as exc:
             await self.notify(f"❌ Ошибка выставления на продажу: {exc}")
             return
+        failed = resp.get("failed") or []
         self.listed.update(item_id(i) for i in items)
         await self.notify(
-            f"💰 Выставлено на продажу {len(offers)} × {self.cfg.market_name} "
-            f"по ${price} (стакан: ${ask:.2f})"
+            f"💰 Выставлено {len(offers) - len(failed)} × {self.cfg.market_name} "
+            f"по ${cents / 100:.2f} (стакан: ${ask:.2f})"
+            + (f"; отклонено: {len(failed)}" if failed else "")
         )
 
 

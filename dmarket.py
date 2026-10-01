@@ -1,19 +1,17 @@
-"""Клиент DMarket Trading API v2: подпись HMAC-SHA256, async-запросы, backoff на 429.
+"""Клиент DMarket Trading API: подпись Ed25519 (nacl), async-запросы, backoff на 429.
 
-Базовые ключи DMarket подписываются HMAC-SHA256 (stdlib hmac), Ed25519 не нужен.
+Актуальная схема (docs.dmarket.com): X-Api-Key + X-Sign-Date (unix ts) +
+X-Request-Sign = "dmar ed25519 " + hex(Ed25519(method + path?query + body + ts)).
 """
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import logging
-from datetime import datetime, timezone
-from email.utils import format_datetime
+import time
 from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
+from nacl.signing import SigningKey
 
 log = logging.getLogger("dmarket")
 
@@ -29,16 +27,19 @@ class DMarketRateLimited(DMarketError):
 
 
 def _sign(secret: bytes, method: str, path: str, query: str, body: str, date: str) -> str:
-    """X-Request-Sign = base64(HMAC-SHA256(method + path + query + body + date))."""
-    string_to_sign = f"{method}{path}{query}{body}{date}"
-    digest = hmac.new(secret, string_to_sign.encode(), hashlib.sha256).digest()
-    return base64.b64encode(digest).decode()
+    """X-Request-Sign = 'dmar ed25519 ' + hex(Ed25519(method + path + ?query + body + date))."""
+    string_to_sign = f"{method}{path}{'?' + query if query else ''}{body}{date}"
+    sig = SigningKey(secret).sign(string_to_sign.encode()).signature.hex()
+    return f"dmar ed25519 {sig}"
 
 
 class DMarketClient:
     def __init__(self, public_key: str, secret_key: str, timeout: float = 15.0) -> None:
         self._public_key = public_key
-        self._secret_key = secret_key.encode()
+        try:
+            self._secret_key = bytes.fromhex(secret_key)  # ключи DMarket — hex
+        except ValueError:
+            self._secret_key = secret_key.encode()
         self._http = httpx.AsyncClient(base_url=BASE_URL, timeout=timeout)
 
     async def aclose(self) -> None:
@@ -57,7 +58,7 @@ class DMarketClient:
         body = json.dumps(json_body, separators=(",", ":")) if json_body else ""
         url = f"{path}?{query}" if query else path
         for attempt in range(max_retries + 1):
-            date = format_datetime(datetime.now(timezone.utc), usegmt=True)
+            date = str(int(time.time()))
             headers = {
                 "X-Api-Key": self._public_key,
                 "X-Sign-Date": date,
@@ -88,59 +89,59 @@ class DMarketClient:
     async def user_inventory(
         self, game_id: str, title: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        """GET /marketplace-api/v1/user-inventory — предметы пользователя."""
+        """GET /marketplace-api/v2/user/inventory — предметы пользователя (v1 удалён, 410)."""
         params: dict[str, Any] = {
-            "Basic": "false",
-            "Limit": limit,
-            "OrderBy": "CreatedAt",
-            "OrderDir": "asc",
-            "GameID": game_id,
+            "game_id": game_id,
+            "limit": limit,
+            "orderBy": "createdAt",
+            "orderDir": "asc",
+            "currency": "USD",
         }
         if title:
-            params["Title"] = title
-        data = await self._request("GET", "/marketplace-api/v1/user-inventory", params=params)
-        return list(data.get("Items") or data.get("items") or [])
+            params["basicFilters.title"] = title
+        data = await self._request("GET", "/marketplace-api/v2/user/inventory", params=params)
+        items = list(data.get("Items") or data.get("items") or [])
+        if title:
+            # ponytail: серверный basicFilters.title игнорирует фильтр — фильтруем локально
+            items = [i for i in items if title.lower() in ((i.get("attributes") or {}).get("name") or "").lower()]
+        return items
 
     async def lowest_ask(self, market_name: str, game_id: str) -> float | None:
-        """Минимальный ask из публичного стакана (GET /exchange/v1/market/items)."""
+        """Минимальный ask из стакана (GET /marketplace-api/v2/offers, orderBy=price asc)."""
         params = {
-            "side": "market",
+            "game_id": game_id,
+            "title": market_name,
+            "currency": "USD",
             "orderBy": "price",
             "orderDir": "asc",
-            "title": market_name,
-            "priceFrom": "0",
-            "priceTo": "0",
-            "types": "dmarket",
-            "cursor": "",
             "limit": "1",
-            "currency": "USD",
-            "gameId": game_id,
         }
         try:
-            data = await self._request("GET", "/exchange/v1/market/items", params=params)
+            data = await self._request("GET", "/marketplace-api/v2/offers", params=params)
         except DMarketError:
             return None
         items = data.get("items") or []
-        if not items:
-            return None
-        raw = items[0].get("bestPrice") or (items[0].get("price") or {}).get("amount")
+        raw = items[0].get("priceCents") if items else None
         try:
-            return float(raw)
+            return float(raw) / 100.0 if raw is not None else None
         except (TypeError, ValueError):
             return None
 
     async def create_sell_offers(self, offers: list[dict[str, Any]]) -> Any:
-        """POST /marketplace-api/v2/offers:batchCreate — выставить предметы на продажу."""
+        """POST /marketplace-api/v2/offers:batchCreate — выставить предметы на продажу.
+
+        offers: [{"assetId": <attributes.id из инвентаря>, "priceCents": 199}]
+        """
         return await self._request(
-            "POST", "/marketplace-api/v2/offers:batchCreate", json_body={"offers": offers}
+            "POST", "/marketplace-api/v2/offers:batchCreate", json_body={"requests": offers}
         )
 
 
 def _self_check() -> None:
     """Регрессионный пин формата подписи: ловит случайный дрейф строки подписи."""
-    sig = _sign(b"sec", "GET", "/exchange/v1/market/items", "limit=1", "", "Mon, 01 Jan 2024 00:00:00 GMT")
-    assert sig == "LOpvDRAzWFTsfiFCnnkMc94vluSE77Sv6xkWin4ivRM=", f"формат подписи изменился: {sig}"
-    print("dmarket: подпись OK —", sig)
+    sig = _sign(b"\x01" * 32, "GET", "/x/v1/y", "limit=1", "", "1605619994")
+    assert sig.startswith("dmar ed25519 ") and len(sig) == 13 + 128, f"формат подписи изменился: {sig}"
+    print("dmarket: подпись OK —", sig[:30] + "…")
 
 
 if __name__ == "__main__":
