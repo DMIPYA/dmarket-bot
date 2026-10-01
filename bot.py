@@ -126,6 +126,7 @@ class Monitor:
         self.errors = 0
         self.sell_menu: list[dict[str, Any]] = []  # нумерованный список для /sell N
         self.overstock_blocked: set[str] = set()  # кейсы, ждущие открытия депозита
+        self.pending_autosell_cls: set[str] = set()  # classId, ждущие баланса для автопродажи
 
     async def check_once(self) -> None:
         items = await self.dm.user_inventory(self.cfg.game_id)
@@ -163,12 +164,68 @@ class Monitor:
             await self.notify(f"🔒 {self.cfg.market_name}: доступных предметов больше нет")
 
     async def deposit_and_sell(self, items: list[dict[str, Any]]) -> None:
-        """AUTO_SELL: депозит открытых предметов, затем продажа по ask−1¢ (после подтверждения трейда в Steam)."""
+        """AUTO_SELL: депозит + продажа по бидам с ходом по стакану.
+
+        Логика (по ТЗ): бид $1.73 на 1 предмет → продаём 1; на 10 → все 10 по этому биду;
+        если объёма верхнего уровня не хватает — остаток уходит уровнем ниже.
+        Продажа = выставление оффера по цене бид-уровня: DMarket матчинг съест его мгновенно.
+        """
         res = await self.deposit_items(items)
         await self.notify(res)
-        # ponytail: продажа после депозита требует подтверждения Steam-трейда пользователем;
-        # полноценный авто-флоу: опрос deposit-status до Done, затем batchCreate. Добавим, когда
-        # авто-режим реально понадобится — сейчас уведомления + /deposit + /sell достаточно.
+        await self.notify(
+            "⏳ Подтверди Steam-трейд — как только предметы придут на баланс (пара минут), "
+            "бот продаст их по лучшим бидам автоматически."
+        )
+        # после депозита id предмета меняется (composite→UUID); матчится только classId (тип)
+        self.pending_autosell_cls = {str((i.get("attributes") or {}).get("classId")) for i in items}
+
+    async def _autosell_ready_items(self) -> None:
+        """Продает предметы из pending_autosell_cls, появившиеся на балансе (UUID, inMarket)."""
+        if not self.pending_autosell_cls:
+            return
+        items = await self.dm.user_inventory(self.cfg.game_id)
+        ready = [
+            i for i in items
+            if i.get("inMarket")
+            and ((i.get("attributes") or {}).get("classId") in self.pending_autosell_cls)
+            and is_uuid(item_id(i))
+            and item_id(i) not in self.listed
+        ]
+        if not ready:
+            return
+        depth = await self.dm.bid_depth(self.cfg.market_name, self.cfg.game_id)
+        if not depth:
+            await self.notify("⚠️ Автопродажа: стакан бидов пуст/недоступен — предметы на балансе, продай через /sell")
+            self.pending_autosell_cls = set()
+            return
+        # раскладка по уровням: каждому предмету — самый выгодный бид с остатком объёма
+        remaining = {price: vol for price, vol in depth}
+        offers: list[dict[str, Any]] = []
+        for i in ready:
+            for price in sorted(remaining, reverse=True):
+                if remaining[price] > 0:
+                    offers.append({"assetId": item_id(i), "priceCents": price})
+                    remaining[price] -= 1
+                    break
+        # ponytail: класс-матчинг fungible-предметов; свои другие предметы того же типа на балансе
+        # тоже попадут в продажу — для одинаковых кейсов это эквивалентно
+        if not offers:
+            await self.notify("⚠️ Автопродажа: объём бидов меньше числа предметов — проданы не все")
+            self.pending_autosell_cls = set()
+            return
+        try:
+            resp = await self.dm.create_sell_offers(offers)
+        except DMarketError as exc:
+            await self.notify(f"❌ Автопродажа: {str(exc)[:200]}")
+            return
+        failed = resp.get("failed") or []
+        self.listed.update(str(o["assetId"]) for o in offers)
+        self.pending_autosell_cls = set()
+        await self.notify(
+            f"💰 Автопродажа: выставлено {len(offers) - len(failed)} шт по бидам "
+            f"(лучший ${depth[0][0] / 100:.2f})"
+            + (f"; отклонено {len(failed)}" if failed else "")
+        )
 
     async def execute_sell(self, n: int, cents: int) -> str:
         """Выставить предмет №n из sell_menu за cents. Возвращает текст результата."""
@@ -466,6 +523,7 @@ async def main() -> None:
         while True:
             try:
                 await monitor.check_once()
+                await monitor._autosell_ready_items()
             except DMarketError as exc:
                 monitor.errors += 1
                 log.warning("DMarket: %s", exc)

@@ -53,10 +53,11 @@ class DMarketClient:
         json_body: dict[str, Any] | None = None,
         max_retries: int = 5,
     ) -> Any:
-        # ponytail: query собираем вручную — подписанная строка обязана совпадать с URL байт-в-байт
+        # ponytail: query собираем вручную — подписанная строка обязана совпадать с URL байт-в-байт.
+        # Путь подписываем DECODED, на провод отправляем percent-encoded (как официальный клиент DMarket).
         query = urlencode(params, quote_via=quote) if params else ""
         body = json.dumps(json_body, separators=(",", ":")) if json_body else ""
-        url = f"{path}?{query}" if query else path
+        url = "/".join(quote(seg, safe="") for seg in path.split("/")) + (f"?{query}" if query else "")
         for attempt in range(max_retries + 1):
             date = str(int(time.time()))
             headers = {
@@ -135,6 +136,21 @@ class DMarketClient:
         return await self._request(
             "POST", "/marketplace-api/v2/offers:batchCreate", json_body={"requests": offers}
         )
+
+    async def bid_depth(self, market_name: str, game_id: str, limit: int = 20) -> list[tuple[int, int]]:
+        """Стакан бидов targets-by-title, убыв. цены: [(цена_центы, объём), …]."""
+        data = await self._request(
+            "GET",
+            f"/marketplace-api/v1/targets-by-title/{game_id}/{market_name}",
+            params={"currency": "USD", "limit": str(limit), "orderBy": "price", "orderDir": "desc"},
+        )
+        out = []
+        for o in data.get("orders") or []:
+            try:
+                out.append((int(o["price"]), int(o["amount"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
 
     async def deposit_assets(self, asset_ids: list[str]) -> Any:
         """POST /marketplace-api/v1/deposit-assets — перенос предметов из Steam на DMarket."""
