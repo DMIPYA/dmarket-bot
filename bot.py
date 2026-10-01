@@ -4,10 +4,13 @@
 """
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -90,6 +93,32 @@ class Monitor:
         )
 
 
+async def _health(_request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_http() -> None:
+    """Render требует открытый порт; /healthz + само-пинг против spin-down (15 мин)."""
+    app = web.Application()
+    app.router.add_get("/healthz", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "10000"))).start()
+
+
+async def keepalive() -> None:
+    base = os.environ.get("RENDER_EXTERNAL_URL")
+    if not base:
+        return  # локальный запуск — пингать некого
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get(f"{base}/healthz", timeout=10)
+            except Exception:
+                log.warning("keepalive: пинг не прошёл")
+            await asyncio.sleep(10 * 60)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -146,7 +175,8 @@ async def main() -> None:
             await asyncio.sleep(settings.monitor_interval)
 
     try:
-        await asyncio.gather(monitor_loop(), dp.start_polling(bot))
+        await start_http()
+        await asyncio.gather(monitor_loop(), dp.start_polling(bot), keepalive())
     finally:
         await dm.aclose()
         await bot.session.close()
