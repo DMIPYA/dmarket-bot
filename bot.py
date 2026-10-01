@@ -61,6 +61,18 @@ def group_inventory(items: list[dict[str, Any]]) -> list[tuple[str, int, int, fl
     return out
 
 
+def overstock_states(items: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
+    """(blocked_ids, unblocked_ids) для предметов в Steam (не inMarket)."""
+    blocked: set[str] = set()
+    open_ids: set[str] = set()
+    for i in items:
+        if i.get("inMarket"):
+            continue
+        tgt = blocked if (i.get("attributes") or {}).get("overstocked") else open_ids
+        tgt.add(item_id(i))
+    return blocked, open_ids
+
+
 def is_uuid(s: str) -> bool:
     return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", s))
 
@@ -113,11 +125,29 @@ class Monitor:
         self.last_ok: float | None = None
         self.errors = 0
         self.sell_menu: list[dict[str, Any]] = []  # нумерованный список для /sell N
+        self.overstock_blocked: set[str] = set()  # кейсы, ждущие открытия депозита
 
     async def check_once(self) -> None:
-        items = await self.dm.user_inventory(self.cfg.game_id, self.cfg.market_name)
+        items = await self.dm.user_inventory(self.cfg.game_id)
         self.last_items = items
         self.last_ok = time.monotonic()
+
+        # ЦЕЛЬ ТЗ: как можно раньше узнать, что DMarket снова принимает кейс (overstocked → False)
+        blocked, open_ids = overstock_states(items)
+        cases_open = [i for i in items if item_id(i) in open_ids and self.cfg.market_name.lower() in item_name(i).lower()]
+        if cases_open and self.overstock_blocked:  # переход: было заблокировано → открылось
+            n = len(cases_open)
+            await self.notify(
+                f"🟢 ТОРГОВЛЯ ОТКРЫТА: DMarket снова принимает «{self.cfg.market_name}» "
+                f"в депозит ({n} шт доступны). Команда: /deposit"
+            )
+            if self.cfg.auto_sell:
+                await self.deposit_and_sell(cases_open)
+        newly_blocked = blocked - self.overstock_blocked
+        if newly_blocked:
+            log.info("overstocked: %s", ", ".join(sorted(newly_blocked)[:3]))
+        self.overstock_blocked = blocked
+
         fresh = [i for i in items if is_tradable(i) and item_id(i) not in self.listed]
         new = [i for i in fresh if item_id(i) not in self.seen_tradable]
         if new:
@@ -131,6 +161,14 @@ class Monitor:
         elif not fresh and self.seen_tradable:
             self.seen_tradable.clear()
             await self.notify(f"🔒 {self.cfg.market_name}: доступных предметов больше нет")
+
+    async def deposit_and_sell(self, items: list[dict[str, Any]]) -> None:
+        """AUTO_SELL: депозит открытых предметов, затем продажа по ask−1¢ (после подтверждения трейда в Steam)."""
+        res = await self.deposit_items(items)
+        await self.notify(res)
+        # ponytail: продажа после депозита требует подтверждения Steam-трейда пользователем;
+        # полноценный авто-флоу: опрос deposit-status до Done, затем batchCreate. Добавим, когда
+        # авто-режим реально понадобится — сейчас уведомления + /deposit + /sell достаточно.
 
     async def execute_sell(self, n: int, cents: int) -> str:
         """Выставить предмет №n из sell_menu за cents. Возвращает текст результата."""
@@ -265,10 +303,16 @@ async def main() -> None:
         ask = await dm.lowest_ask(settings.market_name, settings.game_id)
         price_line = f"Лучший ask: ${ask:.2f}" if ask is not None else "Цена стакана недоступна"
         last_ok = "—" if monitor.last_ok is None else f"{fmt_dur(time.monotonic() - monitor.last_ok)} назад"
+        cases_waiting = len(monitor.overstock_blocked)
+        gate_line = (
+            f"Депозит кейсов: ⛔ закрыт (overstocked, {cases_waiting} шт ждут)"
+            if cases_waiting else "Депозит кейсов: 🟢 открыт"
+        )
         await message.answer(
             f"🟢 Работает. Аптайм: {fmt_dur(time.monotonic() - monitor.started_at)}\n"
             f"Инвентарь: {len(monitor.last_items)} шт, из них tradable: {len(fresh)}\n"
             f"Кейс: {price_line}\n"
+            f"{gate_line}\n"
             f"Успешных циклов назад: {last_ok} (ошибок: {monitor.errors})\n"
             f"Автопродажа: {'вкл' if settings.auto_sell else 'выкл'}"
         )
