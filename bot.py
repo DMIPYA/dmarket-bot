@@ -183,7 +183,11 @@ class Monitor:
                 f"(всего в инвентаре {len(items)})"
             )
             if self.cfg.auto_sell:
-                await self.sell_items(new)
+                # продаём только то, что уже на балансе DMarket (UUID); предметы в Steam
+                # уходит через депозит-флоу открытия торгов (overstock-гейт)
+                ready = [i for i in new if i.get("inMarket") and is_uuid(item_id(i))]
+                if ready:
+                    await self.sell_by_bids(ready)
         elif not fresh and self.seen_tradable:
             self.seen_tradable.clear()
             await self.notify(f"🔒 {self.cfg.market_name}: доступных предметов больше нет")
@@ -214,39 +218,8 @@ class Monitor:
         ]
         if not ready:
             return
-        depth = await self.dm.bid_depth(self.cfg.market_name, self.cfg.game_id)
-        if not depth:
-            await self.notify("⚠️ Автопродажа: стакан бидов пуст/недоступен — предметы на балансе, продай через /sell")
-            self.pending_autosell_cls = set()
-            return
-        # раскладка по уровням: каждому предмету — самый выгодный бид с остатком объёма
-        remaining = {price: vol for price, vol in depth}
-        offers: list[dict[str, Any]] = []
-        for i in ready:
-            for price in sorted(remaining, reverse=True):
-                if remaining[price] > 0:
-                    offers.append({"assetId": item_id(i), "priceCents": price})
-                    remaining[price] -= 1
-                    break
-        # ponytail: класс-матчинг fungible-предметов; свои другие предметы того же типа на балансе
-        # тоже попадут в продажу — для одинаковых кейсов это эквивалентно
-        if not offers:
-            await self.notify("⚠️ Автопродажа: объём бидов меньше числа предметов — проданы не все")
-            self.pending_autosell_cls = set()
-            return
-        try:
-            resp = await self.dm.create_sell_offers(offers)
-        except DMarketError as exc:
-            await self.notify(f"❌ Автопродажа: {str(exc)[:200]}")
-            return
-        failed = resp.get("failed") or []
-        self.listed.update(str(o["assetId"]) for o in offers)
+        await self.sell_by_bids(ready)
         self.pending_autosell_cls = set()
-        await self._end_cycle(
-            f"🏁 Автопродажа: продано {len(offers) - len(failed)} шт по бидам "
-            f"(лучший ${depth[0][0] / 100:.2f})"
-            + (f"; отклонено {len(failed)}" if failed else "")
-        )
 
     async def execute_sell(self, n: int, cents: int) -> str:
         """Выставить предмет №n из sell_menu за cents. Возвращает текст результата."""
@@ -323,26 +296,35 @@ class Monitor:
             )
         return await self.execute_sell(n, cents)
 
-    async def sell_items(self, items: list[dict[str, Any]]) -> None:
-        # ponytail: цена = лучший ask стакана − $0.01 (фронт книги, продажа за секунды);
-        # если DMarket откроет прямой sell-to-buy-order эндпоинт — заменить этот расчёт
-        ask = await self.dm.lowest_ask(self.cfg.market_name, self.cfg.game_id)
-        if ask is None:
-            await self.notify("⚠️ Не удалось получить цену стакана — продажа отложена до следующего цикла")
+    async def sell_by_bids(self, ready: list[dict[str, Any]]) -> None:
+        """Единый путь продажи: раскладка предметов по стакану бидов (лучший уровень вниз)."""
+        depth = await self.dm.bid_depth(self.cfg.market_name, self.cfg.game_id)
+        if not depth:
+            await self.notify("⚠️ Автопродажа: стакан бидов пуст/недоступен — предметы на балансе, продай через /sell")
             return
-        cents = max(round((ask - 0.01) * 100), 1)
-        offers = [{"assetId": item_id(i), "priceCents": cents} for i in items]
+        # раскладка по уровням: каждому предмету — самый выгодный бид с остатком объёма
+        remaining = {price: vol for price, vol in depth}
+        offers: list[dict[str, Any]] = []
+        for i in ready:
+            for price in sorted(remaining, reverse=True):
+                if remaining[price] > 0:
+                    offers.append({"assetId": item_id(i), "priceCents": price})
+                    remaining[price] -= 1
+                    break
+        if not offers:
+            await self.notify("⚠️ Автопродажа: объём бидов меньше числа предметов — проданы не все")
+            return
         try:
             resp = await self.dm.create_sell_offers(offers)
         except DMarketError as exc:
-            await self.notify(f"❌ Ошибка выставления на продажу: {exc}")
+            await self.notify(f"❌ Автопродажа: {str(exc)[:200]}")
             return
         failed = resp.get("failed") or []
-        self.listed.update(item_id(i) for i in items)
-        await self.notify(
-            f"💰 Выставлено {len(offers) - len(failed)} × {self.cfg.market_name} "
-            f"по ${cents / 100:.2f} (стакан: ${ask:.2f})"
-            + (f"; отклонено: {len(failed)}" if failed else "")
+        self.listed.update(str(o["assetId"]) for o in offers)
+        await self._end_cycle(
+            f"🏁 Автопродажа: продано {len(offers) - len(failed)} шт по бидам "
+            f"(лучший ${depth[0][0] / 100:.2f})"
+            + (f"; отклонено {len(failed)}" if failed else "")
         )
 
 
