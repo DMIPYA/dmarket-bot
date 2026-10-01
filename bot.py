@@ -127,6 +127,7 @@ class Monitor:
         self.sell_menu: list[dict[str, Any]] = []  # нумерованный список для /sell N
         self.overstock_blocked: set[str] = set()  # кейсы, ждущие открытия депозита
         self.pending_autosell_cls: set[str] = set()  # classId, ждущие баланса для автопродажи
+        self.pending_deposits: dict[str, float] = {}  # deposit_id → время последнего напоминания
 
     async def check_once(self) -> None:
         items = await self.dm.user_inventory(self.cfg.game_id)
@@ -172,10 +173,6 @@ class Monitor:
         """
         res = await self.deposit_items(items)
         await self.notify(res)
-        await self.notify(
-            "⏳ Подтверди Steam-трейд — как только предметы придут на баланс (пара минут), "
-            "бот продаст их по лучшим бидам автоматически."
-        )
         # после депозита id предмета меняется (composite→UUID); матчится только classId (тип)
         self.pending_autosell_cls = {str((i.get("attributes") or {}).get("classId")) for i in items}
 
@@ -262,11 +259,33 @@ class Monitor:
                 )
             return f"❌ Депозит: {str(exc)[:200]}"
         dep_id = resp.get("DepositID") or resp.get("depositId") or "?"
+        if dep_id != "?":
+            self.pending_deposits[dep_id] = time.monotonic()
         return (
             f"📦 Депозит запрошен ({len(ids)} шт, ID {dep_id}).\n"
-            "Подтверди трейд в Steam (могут прийти 2 оффера), затем подожди пару минут "
-            "и проверь /invent — предметы станут inMarket."
+            "⏳ Подтверди трейд в Steam — бот напомнит, если он висит непринятым."
         )
+
+    async def _poll_deposits(self) -> None:
+        """Напоминание «⏳ подтверди трейд», пока депозит висит Pending; ✅/⚠️ по исходу."""
+        for dep_id in list(self.pending_deposits):
+            try:
+                st = await self.dm.deposit_status(dep_id)
+            except DMarketError:
+                continue  # временный сбой — попробуем в следующем цикле
+            status = str(st.get("Status") or "")
+            if status == "TransferStatusPending":
+                if time.monotonic() - self.pending_deposits[dep_id] > 15 * 60:
+                    offer = str((st.get("SteamDepositInfo") or {}).get("TradeOfferID") or "")
+                    link = f": https://steamcommunity.com/tradeoffer/{offer}/" if offer else ""
+                    await self.notify(f"⏳ Подтверди трейд в Steam{link}")
+                    self.pending_deposits[dep_id] = time.monotonic()
+            elif status == "TransferStatusSuccess":
+                await self.notify("✅ Трейд принят — предметы на балансе DMarket")
+                del self.pending_deposits[dep_id]
+            elif status:
+                await self.notify(f"⚠️ Депозит не прошёл: {str(st.get('Error') or status)[:120]}")
+                del self.pending_deposits[dep_id]
 
     async def execute_sell_if_confirmed(self, n: int, cents: int, args: list[str]) -> str:
         if len(args) < 3 or args[2].lower() != "подтвердить":
@@ -523,6 +542,7 @@ async def main() -> None:
         while True:
             try:
                 await monitor.check_once()
+                await monitor._poll_deposits()
                 await monitor._autosell_ready_items()
             except DMarketError as exc:
                 monitor.errors += 1

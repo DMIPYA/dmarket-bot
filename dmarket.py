@@ -158,6 +158,10 @@ class DMarketClient:
             "POST", "/marketplace-api/v1/deposit-assets", json_body={"AssetID": asset_ids}
         )
 
+    async def deposit_status(self, deposit_id: str) -> Any:
+        """GET /marketplace-api/v1/deposit-status/{id} — статус трейда депозита."""
+        return await self._request("GET", f"/marketplace-api/v1/deposit-status/{deposit_id}")
+
 
 def _self_check() -> None:
     """Регрессионный пин формата подписи: ловит случайный дрейф строки подписи."""
