@@ -160,6 +160,11 @@ class Monitor:
         try:
             resp = await self.dm.deposit_assets(ids)
         except DMarketError as exc:
+            if "UnavailableItem" in str(exc):
+                return (
+                    "⛔ DMarket не принимает этот предмет в депозит сейчас (overstocked — "
+                    "их боты переполнены им). Повтори позже, сток расходится."
+                )
             return f"❌ Депозит: {str(exc)[:200]}"
         dep_id = resp.get("DepositID") or resp.get("depositId") or "?"
         return (
@@ -359,7 +364,11 @@ async def main() -> None:
             await message.answer("Нет предметов в Steam, доступных для депозита")
             return
         if not args:
-            monitor.sell_menu = steam_items[:20]  # переиспользуем нумерацию
+            steam_items = [i for i in steam_items if not (i.get("attributes") or {}).get("overstocked")][:20]
+            if not steam_items:
+                await message.answer("Все предметы из Steam сейчас overstocked — DMarket их не принимает. Повтори позже.")
+                return
+            monitor.sell_menu = steam_items  # переиспользуем нумерацию
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"📦 {item_name(i)[:30]}", callback_data=f"dep:{n}")]
                 for n, i in enumerate(monitor.sell_menu, 1)
