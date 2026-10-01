@@ -37,6 +37,35 @@ def is_tradable(item: dict[str, Any]) -> bool:
     return str(item.get("status", "")).strip().lower() in TRADABLE_STATUSES
 
 
+def item_name(item: dict[str, Any]) -> str:
+    return str(((item.get("attributes") or {}).get("name")) or "?")
+
+
+def group_inventory(items: list[dict[str, Any]]) -> list[tuple[str, int, int, float | None]]:
+    """Группировка инвентаря: [(имя, всего, tradable, мин. реком. цена)]."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for i in items:
+        groups.setdefault(item_name(i), []).append(i)
+    out = []
+    for name_, group in groups.items():
+        trad = sum(1 for i in group if is_tradable(i))
+        prices = []
+        for i in group:
+            try:
+                prices.append(float(str((i.get("offerRecommendedPrice") or {}).get("Amount"))))
+            except (TypeError, ValueError):
+                pass
+        out.append((name_, len(group), trad, min(prices) if prices else None))
+    out.sort(key=lambda g: -g[1])
+    return out
+
+
+def fmt_dur(sec: float) -> str:
+    m, s = divmod(max(int(sec), 0), 60)
+    h, m = divmod(m, 60)
+    return f"{h}ч {m}м" if h else (f"{m}м {s}с" if m else f"{s}с")
+
+
 class Monitor:
     """Следит за статусом предметов в инвентаре DMarket, уведомляет и продаёт при разблокировке."""
 
@@ -52,10 +81,15 @@ class Monitor:
         self.seen_tradable: set[str] = set()
         self.listed: set[str] = set()  # уже выставлены — защита от двойного листинга
         self.last_items: list[dict[str, Any]] = []
+        self.started_at = time.monotonic()
+        self.last_ok: float | None = None
+        self.errors = 0
+        self.sell_menu: list[dict[str, Any]] = []  # нумерованный список для /sell N
 
     async def check_once(self) -> None:
         items = await self.dm.user_inventory(self.cfg.game_id, self.cfg.market_name)
         self.last_items = items
+        self.last_ok = time.monotonic()
         fresh = [i for i in items if is_tradable(i) and item_id(i) not in self.listed]
         new = [i for i in fresh if item_id(i) not in self.seen_tradable]
         if new:
@@ -145,20 +179,75 @@ async def main() -> None:
         fresh = [i for i in monitor.last_items if is_tradable(i) and item_id(i) not in monitor.listed]
         ask = await dm.lowest_ask(settings.market_name, settings.game_id)
         price_line = f"Лучший ask: ${ask:.2f}" if ask is not None else "Цена стакана недоступна"
+        last_ok = "—" if monitor.last_ok is None else f"{fmt_dur(time.monotonic() - monitor.last_ok)} назад"
         await message.answer(
-            f"Статус: {len(fresh)} доступно / {len(monitor.last_items)} в инвентаре\n"
-            f"{price_line}\n"
+            f"🟢 Работает. Аптайм: {fmt_dur(time.monotonic() - monitor.started_at)}\n"
+            f"Инвентарь: {len(monitor.last_items)} шт, из них tradable: {len(fresh)}\n"
+            f"Кейс: {price_line}\n"
+            f"Успешных циклов назад: {last_ok} (ошибок: {monitor.errors})\n"
             f"Автопродажа: {'вкл' if settings.auto_sell else 'выкл'}"
         )
 
+    @dp.message(Command("invent"))
+    async def invent_cmd(message: Message) -> None:
+        items = await dm.user_inventory(settings.game_id)
+        if not items:
+            await message.answer("Инвентарь пуст")
+            return
+        lines = ["📦 Инвентарь DMarket:"]
+        for name_, total, trad, price in group_inventory(items)[:30]:
+            p = f" ~${price:.2f}" if price is not None else ""
+            lines.append(f"• {name_}: {total} шт ({trad} tradable{p})")
+        if len(items) > 30:
+            lines.append("…")
+        await message.answer("\n".join(lines))
+
     @dp.message(Command("sell"))
     async def sell_cmd(message: Message) -> None:
+        args = (message.text or "").split()[1:]
         fresh = [i for i in monitor.last_items if is_tradable(i) and item_id(i) not in monitor.listed]
+        if not fresh:
+            # последний опрос не видел tradable — перепроверим живым запросом
+            fresh = [i for i in await dm.user_inventory(settings.game_id) if is_tradable(i)]
+        fresh = [i for i in fresh if item_id(i) not in monitor.listed]
         if not fresh:
             await message.answer("Нет предметов, доступных для продажи")
             return
-        await message.answer(f"Выставляю {len(fresh)} шт…")
-        await monitor.sell_items(fresh)
+        if not args:
+            monitor.sell_menu = fresh[:20]
+            lines = ["Выбери предмет (номер) и цену: /sell <№> <цена$>"]
+            for n, i in enumerate(monitor.sell_menu, 1):
+                p = (i.get("offerRecommendedPrice") or {}).get("Amount") or "?"
+                lines.append(f"{n}. {item_name(i)} — рек. ${p}")
+            await message.answer("\n".join(lines))
+            return
+        try:
+            num = int(args[0])
+            price = round(float(args[1].replace(",", ".")) * 100)
+            item = monitor.sell_menu[num - 1]
+        except (IndexError, ValueError):
+            await message.answer("Формат: /sell (список) или /sell <№> <цена$> <подтвердить>")
+            return
+        if len(args) < 3 or args[2].lower() != "подтвердить":
+            await message.answer(
+                f"Выставить «{item_name(item)}» за ${price / 100:.2f}?\n"
+                f"Для подтверждения: /sell {num} {price / 100:.2f} подтвердить"
+            )
+            return
+        if item_id(item) in monitor.listed:
+            await message.answer("Этот предмет уже выставлен")
+            return
+        try:
+            resp = await dm.create_sell_offers([{"assetId": item_id(item), "priceCents": price}])
+        except DMarketError as exc:
+            await message.answer(f"❌ DMarket: {exc}")
+            return
+        failed = resp.get("failed") or []
+        if failed:
+            await message.answer(f"❌ Отклонено: {str(failed[0])[:200]}")
+            return
+        monitor.listed.add(item_id(item))
+        await message.answer(f"💰 Выставлено: {item_name(item)} за ${price / 100:.2f}")
 
     async def monitor_loop() -> None:
         await notify(
@@ -169,8 +258,10 @@ async def main() -> None:
             try:
                 await monitor.check_once()
             except DMarketError as exc:
+                monitor.errors += 1
                 log.warning("DMarket: %s", exc)
             except Exception:
+                monitor.errors += 1
                 log.exception("сбой цикла мониторинга")
             await asyncio.sleep(settings.monitor_interval)
 
