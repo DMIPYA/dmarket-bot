@@ -113,11 +113,13 @@ class Monitor:
         self,
         dmarket: DMarketClient,
         cfg: Settings,
-        notify: Callable[[str], Awaitable[None]],
+        notify: Callable[[str], Awaitable[int | None]],
+        delete: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         self.dm = dmarket
         self.cfg = cfg
         self.notify = notify
+        self._delete = delete
         self.seen_tradable: set[str] = set()
         self.listed: set[str] = set()  # уже выставлены — защита от двойного листинга
         self.last_items: list[dict[str, Any]] = []
@@ -128,6 +130,24 @@ class Monitor:
         self.overstock_blocked: set[str] = set()  # кейсы, ждущие открытия депозита
         self.pending_autosell_cls: set[str] = set()  # classId, ждущие баланса для автопродажи
         self.pending_deposits: dict[str, float] = {}  # deposit_id → время последнего напоминания
+        self.cycle_msgs: list[int] = []  # промежуточные сообщения цикла — удалятся в конце
+
+    async def _track(self, text: str) -> None:
+        """Промежуточное сообщение цикла: отправить и запомнить на удаление."""
+        mid = await self.notify(text)
+        if mid:
+            self.cycle_msgs.append(mid)
+
+    async def _end_cycle(self, final: str) -> None:
+        """Удалить всю промежуточную переписку цикла, оставить только финальное резюме."""
+        if self._delete:
+            for mid in self.cycle_msgs:
+                try:
+                    await self._delete(mid)
+                except Exception:
+                    pass  # сообщение могло уже уйти — не критично
+        self.cycle_msgs = []
+        await self.notify(final)
 
     async def check_once(self) -> None:
         items = await self.dm.user_inventory(self.cfg.game_id)
@@ -139,12 +159,16 @@ class Monitor:
         cases_open = [i for i in items if item_id(i) in open_ids and self.cfg.market_name.lower() in item_name(i).lower()]
         if cases_open and self.overstock_blocked:  # переход: было заблокировано → открылось
             n = len(cases_open)
-            await self.notify(
+            await self._track(
                 f"🟢 ТОРГОВЛЯ ОТКРЫТА: DMarket снова принимает «{self.cfg.market_name}» "
-                f"в депозит ({n} шт доступны). Команда: /deposit"
+                f"в депозит ({n} шт доступны)"
             )
             if self.cfg.auto_sell:
                 await self.deposit_and_sell(cases_open)
+                await self._end_cycle(
+                    f"🏁 Цикл завершён: торговля открыта, {n} шт «{self.cfg.market_name}» "
+                    f"отправлены в депозит — подтверди трейд в Steam, автопродажа сработает сама."
+                )
         newly_blocked = blocked - self.overstock_blocked
         if newly_blocked:
             log.info("overstocked: %s", ", ".join(sorted(newly_blocked)[:3]))
@@ -218,8 +242,8 @@ class Monitor:
         failed = resp.get("failed") or []
         self.listed.update(str(o["assetId"]) for o in offers)
         self.pending_autosell_cls = set()
-        await self.notify(
-            f"💰 Автопродажа: выставлено {len(offers) - len(failed)} шт по бидам "
+        await self._end_cycle(
+            f"🏁 Автопродажа: продано {len(offers) - len(failed)} шт по бидам "
             f"(лучший ${depth[0][0] / 100:.2f})"
             + (f"; отклонено {len(failed)}" if failed else "")
         )
@@ -278,10 +302,12 @@ class Monitor:
                 if time.monotonic() - self.pending_deposits[dep_id] > 15 * 60:
                     offer = str((st.get("SteamDepositInfo") or {}).get("TradeOfferID") or "")
                     link = f": https://steamcommunity.com/tradeoffer/{offer}/" if offer else ""
-                    await self.notify(f"⏳ Подтверди трейд в Steam{link}")
+                    await self._track(f"⏳ Подтверди трейд в Steam{link}")
                     self.pending_deposits[dep_id] = time.monotonic()
             elif status == "TransferStatusSuccess":
-                await self.notify("✅ Трейд принят — предметы на балансе DMarket")
+                await self._end_cycle(
+                    "✅ Трейд принят — предметы на балансе DMarket, автопродажа по бидам запущена"
+                )
                 del self.pending_deposits[dep_id]
             elif status:
                 await self.notify(f"⚠️ Депозит не прошёл: {str(st.get('Error') or status)[:120]}")
@@ -363,13 +389,18 @@ async def main() -> None:
         BotCommand(command="deposit", description="Перенести предмет из Steam на DMarket"),
     ])
 
-    async def notify(text: str) -> None:
+    async def notify(text: str) -> int | None:
         try:
-            await bot.send_message(chat_id, text)
+            msg = await bot.send_message(chat_id, text)
+            return msg.message_id
         except Exception:
             log.exception("не удалось отправить сообщение в Telegram")
+            return None
 
-    monitor = Monitor(dm, settings, notify)
+    async def delete_msg(message_id: int) -> None:
+        await bot.delete_message(chat_id, message_id)
+
+    monitor = Monitor(dm, settings, notify, delete_msg)
     dp = Dispatcher()
     dp.message.filter(F.chat.id == chat_id)  # команды только из нашего чата
 
