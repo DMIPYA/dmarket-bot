@@ -13,7 +13,7 @@ import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import Settings, settings
 from dmarket import DMarketClient, DMarketError
@@ -60,6 +60,42 @@ def group_inventory(items: list[dict[str, Any]]) -> list[tuple[str, int, int, fl
     return out
 
 
+def parse_sell_cb(data: str) -> tuple[str, int, int | None]:
+    """'pick:3' / 'price:3:150' / 'go:3:150' → (action, n, cents | None)."""
+    action, _, rest = data.partition(":")
+    parts = rest.split(":")
+    n = int(parts[0])
+    cents = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    return action, n, cents
+
+
+def rec_price(item: dict[str, Any]) -> float | None:
+    try:
+        return float(str((item.get("offerRecommendedPrice") or {}).get("Amount")))
+    except (TypeError, ValueError):
+        return None
+
+
+def price_buttons(n: int, rec: float | None, ask: float | None) -> list[list[InlineKeyboardButton]]:
+    """Варианты цены: рекомендация, ask-0.01, ask, ask+0.01 (без дублей)."""
+    variants: list[float] = []
+    for p in (rec, ask - 0.01 if ask else None, ask, (ask + 0.01) if ask else None):
+        if p is not None and p > 0 and all(abs(p - v) > 0.005 for v in variants):
+            variants.append(p)
+    out = []
+    for p in variants:
+        cents = max(round(p * 100), 1)
+        out.append([InlineKeyboardButton(text=f"${p:.2f}", callback_data=f"price:{n}:{cents}")])
+    return out
+
+
+def confirm_kb(n: int, cents: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Выставить за ${cents / 100:.2f}", callback_data=f"go:{n}:{cents}"),
+        InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel"),
+    ]])
+
+
 def fmt_dur(sec: float) -> str:
     m, s = divmod(max(int(sec), 0), 60)
     h, m = divmod(m, 60)
@@ -103,6 +139,33 @@ class Monitor:
         elif not fresh and self.seen_tradable:
             self.seen_tradable.clear()
             await self.notify(f"🔒 {self.cfg.market_name}: доступных предметов больше нет")
+
+    async def execute_sell(self, n: int, cents: int) -> str:
+        """Выставить предмет №n из sell_menu за cents. Возвращает текст результата."""
+        if not (1 <= n <= len(self.sell_menu)):
+            return "Неверный номер предмета — вызови /sell заново"
+        item = self.sell_menu[n - 1]
+        if item_id(item) in self.listed:
+            return "Этот предмет уже выставлен"
+        try:
+            resp = await self.dm.create_sell_offers([{"assetId": item_id(item), "priceCents": cents}])
+        except DMarketError as exc:
+            return f"❌ DMarket: {str(exc)[:200]}"
+        failed = resp.get("failed") or []
+        if failed:
+            return f"❌ Отклонено: {str(failed[0])[:200]}"
+        self.listed.add(item_id(item))
+        return f"💰 Выставлено: {item_name(item)} за ${cents / 100:.2f}"
+
+    async def execute_sell_if_confirmed(self, n: int, cents: int, args: list[str]) -> str:
+        if len(args) < 3 or args[2].lower() != "подтвердить":
+            if not (1 <= n <= len(self.sell_menu)):
+                return "Неверный номер — вызови /sell заново"
+            return (
+                f"Выставить «{item_name(self.sell_menu[n - 1])}» за ${cents / 100:.2f}?\n"
+                f"Подтверждение: /sell {n} {cents / 100:.2f} подтвердить"
+            )
+        return await self.execute_sell(n, cents)
 
     async def sell_items(self, items: list[dict[str, Any]]) -> None:
         # ponytail: цена = лучший ask стакана − $0.01 (фронт книги, продажа за секунды);
@@ -163,6 +226,11 @@ async def main() -> None:
 
     bot = Bot(settings.telegram_bot_token)
     dm = DMarketClient(settings.dmarket_public_key, settings.dmarket_secret_key)
+    await bot.set_my_commands([
+        BotCommand(command="status", description="Состояние бота и кейса"),
+        BotCommand(command="invent", description="Инвентарь DMarket"),
+        BotCommand(command="sell", description="Выставить предмет на продажу"),
+    ])
 
     async def notify(text: str) -> None:
         try:
@@ -215,39 +283,49 @@ async def main() -> None:
             return
         if not args:
             monitor.sell_menu = fresh[:20]
-            lines = ["Выбери предмет (номер) и цену: /sell <№> <цена$>"]
-            for n, i in enumerate(monitor.sell_menu, 1):
-                p = (i.get("offerRecommendedPrice") or {}).get("Amount") or "?"
-                lines.append(f"{n}. {item_name(i)} — рек. ${p}")
-            await message.answer("\n".join(lines))
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{item_name(i)[:30]} — ${rec_price(i)}", callback_data=f"pick:{n}")]
+                for n, i in enumerate(monitor.sell_menu, 1)
+            ])
+            await message.answer("Выбери предмет для продажи:", reply_markup=kb)
             return
         try:
             num = int(args[0])
             price = round(float(args[1].replace(",", ".")) * 100)
-            item = monitor.sell_menu[num - 1]
         except (IndexError, ValueError):
             await message.answer("Формат: /sell (список) или /sell <№> <цена$> <подтвердить>")
             return
-        if len(args) < 3 or args[2].lower() != "подтвердить":
-            await message.answer(
-                f"Выставить «{item_name(item)}» за ${price / 100:.2f}?\n"
-                f"Для подтверждения: /sell {num} {price / 100:.2f} подтвердить"
+        await message.answer(await monitor.execute_sell_if_confirmed(num, price, args))
+
+    @dp.callback_query(F.data.startswith(("pick:", "price:", "go:", "cancel")))
+    async def sell_cb(cb: CallbackQuery) -> None:
+        async def edit(text: str, kb: InlineKeyboardMarkup | None = None) -> None:
+            if isinstance(cb.message, Message):
+                await cb.message.edit_text(text, reply_markup=kb)
+
+        data = cb.data or ""
+        if data == "cancel":
+            await edit("Продажа отменена")
+            await cb.answer()
+            return
+        action, n, cents = parse_sell_cb(data)
+        if not (1 <= n <= len(monitor.sell_menu)):
+            await cb.answer("Список устарел — вызови /sell заново", show_alert=True)
+            return
+        item = monitor.sell_menu[n - 1]
+        if action == "pick":
+            ask = await dm.lowest_ask(item_name(item), settings.game_id)
+            rows = price_buttons(n, rec_price(item), ask)
+            kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel")]])
+            await edit(
+                f"«{item_name(item)}»\nЛучший ask: {'${:.2f}'.format(ask) if ask else '—'}\nВыбери цену:",
+                kb,
             )
-            return
-        if item_id(item) in monitor.listed:
-            await message.answer("Этот предмет уже выставлен")
-            return
-        try:
-            resp = await dm.create_sell_offers([{"assetId": item_id(item), "priceCents": price}])
-        except DMarketError as exc:
-            await message.answer(f"❌ DMarket: {exc}")
-            return
-        failed = resp.get("failed") or []
-        if failed:
-            await message.answer(f"❌ Отклонено: {str(failed[0])[:200]}")
-            return
-        monitor.listed.add(item_id(item))
-        await message.answer(f"💰 Выставлено: {item_name(item)} за ${price / 100:.2f}")
+        elif action == "price" and cents is not None:
+            await edit(f"Выставить «{item_name(item)}» за ${cents / 100:.2f}?", confirm_kb(n, cents))
+        elif action == "go" and cents is not None:
+            await edit(await monitor.execute_sell(n, cents))
+        await cb.answer()
 
     async def monitor_loop() -> None:
         await notify(
