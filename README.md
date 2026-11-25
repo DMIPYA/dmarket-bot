@@ -1,59 +1,39 @@
-# DMarket Auto-Sell Bot
+# DMarket Bot
 
-Асинхронный Python-бот: следит за статусом предметов в инвентаре DMarket (по умолчанию —
-Dreams & Nightmares Case), при снятии trade-lock мгновенно уведомляет в Telegram и
-(опционально) сразу выставляет предмет на продажу через `POST /marketplace-api/v2/offers:batchCreate`.
-Деплой — на Koyeb как worker.
+**Мониторинг инвентаря DMarket и управление предметами из Telegram.**
 
-## Структура
+Бот отслеживает доступность предметов, сообщает об изменениях торговой блокировки и показывает состояние инвентаря. Владелец настроенного чата может переносить предметы из Steam на DMarket и выставлять их на продажу.
 
-- `bot.py` — точка входа: asyncio-петля мониторинга (5 c) + Telegram-команды
-- `dmarket.py` — клиент DMarket API: подпись HMAC-SHA256, запросы httpx, backoff на 429
-- `config.py` — переменные окружения через pydantic-settings
-- `requirements.txt`, `Procfile`, `.env.example`
+## Команды
 
-## Команды Telegram (только из чата TELEGRAM_CHAT_ID)
+| Команда | Действие |
+| --- | --- |
+| `/status` | Показать состояние мониторинга и данные об отслеживаемом предмете |
+| `/invent` | Посмотреть инвентарь DMarket |
+| `/sell` | Выбрать и выставить предметы на продажу |
+| `/deposit` | Перенести выбранные предметы из Steam на DMarket |
 
-- `/status` — сколько кейсов доступно, лучший ask, состояние автопродажи
-- `/sell` — вручную выставить все доступные кейсы на продажу
+Автопродажа выключена по умолчанию (`AUTO_SELL=false`). Включение автопродажи разрешает реальные сделки через подключённый аккаунт DMarket.
 
-## Локальный запуск
+## Запуск
+
+Dockerfile использует Python 3.12. Для локального запуска создайте виртуальное окружение, скопируйте [`.env.example`](.env.example) в `.env`, затем заполните параметры Telegram и DMarket.
 
 ```bash
-python -m venv .venv
-.venv/Scripts/activate        # Windows; Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # заполните ключи
+python -m pip install -r requirements.txt
 python bot.py
 ```
 
-Самопроверка модуля подписи (без сети): `python dmarket.py`
+Обязательные параметры: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DMARKET_PUBLIC_KEY`, `DMARKET_SECRET_KEY`. Название предмета и интервал опроса задаются через `MARKET_NAME` и `MONITOR_INTERVAL`.
 
-## Загрузка на GitHub
+Для контейнерного запуска используйте [`Dockerfile`](Dockerfile) и передайте `.env` через `docker run --env-file .env`. На Koyeb команда процесса указана в [`Procfile`](Procfile). Сетевые параметры и переменные окружения задаются на стороне платформы.
 
-```bash
-git init
-git add .
-git commit -m "DMarket auto-sell bot"
-git branch -M main
-git remote add origin https://github.com/<ваш-логин>/dmarket-bot.git
-git push -u origin main
-```
+## Устройство проекта
 
-`.env` в git не попадает (`.gitignore`).
+| Файл | Роль |
+| --- | --- |
+| [`bot.py`](bot.py) | Обработчики aiogram, цикл мониторинга и сценарии работы с предметами |
+| [`dmarket.py`](dmarket.py) | Асинхронный API клиент с подписью Ed25519 через PyNaCl и повторными попытками при HTTP 429 |
+| [`config.py`](config.py) | Настройки окружения на базе Pydantic Settings |
 
-## Запуск на Koyeb
-
-1. Koyeb → **Create App** → источник: GitHub-репозиторий.
-2. Builder: **Buildpack** — процесс `worker` подхватится из `Procfile`.
-   Если воркер не определился — задайте Run Command вручную: `python bot.py`.
-3. Вкладка **Environment**: добавьте переменные из `.env.example`
-   (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DMARKET_PUBLIC_KEY`, `DMARKET_SECRET_KEY`, при желании `AUTO_SELL`).
-4. **Deploy**. Логи — во вкладке Logs; о запуске бот пришлёт «🚀 Бот запущен» в Telegram.
-
-## Заметки
-
-- Подпись запросов — HMAC-SHA256 (базовые ключи DMarket; `hmac` из stdlib, Ed25519 не требуется).
-- Цена автопродажи: лучший ask стакана − $0.01 (фронт книги → продажа за секунды).
-- 429 обрабатывается экспоненциальным backoff (1/2/4/…60 c) внутри `dmarket.py`.
-- `AUTO_SELL=false` по умолчанию: включайте, только если готовы к реальной продаже за деньги.
+`python dmarket.py` запускает локальную самопроверку модуля подписи без обращения к DMarket.
